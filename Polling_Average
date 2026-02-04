@@ -8,30 +8,46 @@ library(tidyverse)
 library(ggthemes)
 library(scales)
 library(lubridate)
+library(ggrepel)
+library(zoo)
 
 # =============================================================================
 # CONFIGURATION - Adjust these parameters
 # =============================================================================
 
-HALF_LIFE_DAYS <- 21        # Half-life for exponential decay (in days)
-MIN_PARTY_POLLS <- 20       # Minimum polls required to display a party
-SHOW_RAW_POLLS <- TRUE      # Show individual poll dots
-SHOW_UNADJUSTED <- FALSE     # Show dotted unadjusted trendlines (no house effects/pollster weights)
-START_DATE <- "2024-06-09"  # Start after EP election (June 9, 2024)
-END_DATE <- NULL            # Set to a date like "2026-01-20" to filter, or NULL for all
-ELECTION_DATE <- ymd("2026-04-12")  # Election day for x-axis limit
+config <- list(
+  half_life = 21,                    # Days for exponential decay
+  
+  use_pollster_weights = TRUE,      # Toggle ON/OFF
+  use_house_effects = TRUE,         # Toggle ON/OFF
+  
+  show_individual_polls = TRUE,      
+  use_direct_labels = TRUE,          
+  
+  start_date = "2024-04-02",      
+  end_date = "2026-04-12"
+)
+
+# Extract config to variables used throughout
+HALF_LIFE_DAYS <- config$half_life
+START_DATE <- config$start_date
+END_DATE <- config$end_date
+SHOW_RAW_POLLS <- config$show_individual_polls
+SHOW_UNADJUSTED <- !config$use_house_effects | !config$use_pollster_weights
+MIN_PARTY_POLLS <- 5
+ELECTION_DATE <- ymd("2026-04-12")
 
 # Party configuration: colors and display names
 # Using colors inspired by actual party colors and 538's palette
 PARTY_CONFIG <- list(
   Fidesz = list(color = "#FD8D3C", name = "Fidesz-KDNP"),
-  Tisza = list(color = "#3182BD", name = "Tisza"),
+  Tisza = list(color = "#6BAED6", name = "TISZA"),
   DK = list(color = "#2171B5", name = "DK"),
   MH = list(color = "#31A354", name = "Mi Hazánk"),
   MKKP = list(color = "#9E9AC8", name = "MKKP"),
-  Momentum = list(color = "#74C476", name = "Momentum"),
+  Momentum = list(color = "#756BB1", name = "Momentum"),
   MSZP = list(color = "#E6550D", name = "MSZP"),
-  Jobbik = list(color = "#756BB1", name = "Jobbik"),
+  Jobbik = list(color = "#4A4A4A", name = "Jobbik"),
   LMP = list(color = "#41AB5D", name = "LMP")
 )
 
@@ -40,32 +56,38 @@ PARTY_CONFIG <- list(
 # =============================================================================
 
 # Read the polling data
-polls <- read_csv("~/downloads/Hungary Parliamentary Elections - 2026_R (2).csv",
+polls <- read_csv("~/downloads/Hungary Parliamentary Elections - 2026_R (5).csv",
                   locale = locale(encoding = "UTF-8"))
 
-# Read house effects data
-house_effects <- read_csv("~/downloads/Hungary Parliamentary Elections - hungarian_weighted_house_effects.csv",
+# Read house effects data (contains both 2024 and 2026 cycle effects)
+house_effects <- read_csv("~/downloads/Hungary Parliamentary Elections - Fidesz_TISZA_HE (1).csv",
                           locale = locale(encoding = "UTF-8")) %>%
-  rename(
-    pollster = Pollster,
-    he_fidesz = MR_Fidesz_HE,
-    he_tisza = MR_Opp_HE
-  )
+  rename(pollster = Pollster)
 
-# Read pollster grades/ratings
-pollster_grades <- read_csv("~/downloads/Hungary Parliamentary Elections - Final Pollster Grades_2026.csv",
-                            locale = locale(encoding = "UTF-8")) %>%
-  rename(pollster = Pollster) %>%
-  select(pollster, Final_Score, Grade)
+# Pollster weights (min-max normalization from Reverted_APM, floor 0.5)
+pollster_grades <- tribble(
+  ~pollster,                  ~pollster_weight,
+  "RealPR 93",                1.000,
+  "Medián",                   0.995,
+  "ZRi",                      0.959,
+  "21 Kutatóközpont",         0.929,
+  "Társadalomkutató",         0.900,
+  "MR Center",                0.872,
+  "e-benchmark",              0.868,
+  "IDEA",                     0.865,
+  "Századvég",                0.851,
+  "Alapjogokért Központ",     0.849,
+  "Nézőpont",                 0.815,
+  "Republikon",               0.773,
+  "Publicus",                 0.751,
+  "Ipsos",                    0.735,
+  "Závecz Research",          0.658,
+  "Iránytű",                  0.653,
+  "Tárki",                    0.500
+)
 
-# Create a pollster weight from grades (convert score to positive weight)
-# Lower Final_Score is better, so we invert it
-# Using a transform: weight = max_score - score + baseline
-pollster_grades <- pollster_grades %>%
-  mutate(
-    # Shift scores so all are positive, then invert so better = higher weight
-    pollster_weight = max(Final_Score) - Final_Score + 1
-  )
+# Default weight for unrated pollsters
+default_weight <- 0.75
 
 # Parse dates - handle the "DD Mon YYYY" format
 polls <- polls %>%
@@ -94,27 +116,49 @@ polls <- polls %>%
 
 # Join pollster weights
 polls <- polls %>%
-  left_join(pollster_grades %>% select(pollster, pollster_weight), 
-            by = c("pollster_clean" = "pollster"))
+  left_join(pollster_grades, by = c("pollster_clean" = "pollster"))
 
-# Set default weight for unrated pollsters (median weight)
-default_weight <- median(pollster_grades$pollster_weight, na.rm = TRUE)
+# Set default weight for unrated pollsters
 polls <- polls %>%
   mutate(pollster_weight = ifelse(is.na(pollster_weight), default_weight, pollster_weight))
 
 # Set default house effects to 0 for pollsters not in the house effects file
+# Use 2024 cycle for polls before June 10, 2024; use 2026 cycle for June 10 onwards
 polls <- polls %>%
   mutate(
-    he_fidesz = ifelse(is.na(he_fidesz), 0, he_fidesz),
-    he_tisza = ifelse(is.na(he_tisza), 0, he_tisza)
+    he_fidesz = case_when(
+      date < ymd("2024-06-10") ~ coalesce(Fidesz_MR_2024Cycle, 0),
+      TRUE ~ coalesce(Fidesz_MR_2026Cycle, 0)
+    ),
+    he_tisza = case_when(
+      date < ymd("2024-06-10") ~ coalesce(Opp_MR_2024Cycle, 0),
+      TRUE ~ coalesce(Opp_MR_2026Cycle, 0)
+    )
   )
 
-# Apply house effects adjustments (subtract house effect to get adjusted value)
+# Apply house effects adjustments conditionally
+if (config$use_house_effects) {
+  polls <- polls %>%
+    mutate(
+      Fidesz_adj = Fidesz - he_fidesz,
+      Tisza_adj = Tisza - he_tisza
+    )
+} else {
+  polls <- polls %>%
+    mutate(
+      Fidesz_adj = Fidesz,
+      Tisza_adj = Tisza
+    )
+}
+
+# Renormalize polls whose sum exceeds 100% (after house effects)
 polls <- polls %>%
   mutate(
-    Fidesz_adj = Fidesz - he_fidesz,
-    Tisza_adj = Tisza - he_tisza
-  )
+    poll_total = rowSums(across(c(Fidesz_adj, Tisza_adj, MH, MKKP, DK, MSZP, Momentum, Jobbik, LMP)), na.rm = TRUE),
+    across(c(Fidesz_adj, Tisza_adj, MH, MKKP, DK, MSZP, Momentum, Jobbik, LMP),
+           ~ if_else(poll_total > 100, . * 100 / poll_total, .))
+  ) %>%
+  select(-poll_total)
 
 # Apply date filters
 if (!is.null(START_DATE)) {
@@ -164,7 +208,7 @@ polls_long_unadj <- polls_long_unadj %>%
 # EXPONENTIAL DECAY WEIGHTED AVERAGE CALCULATION (WITH POLLSTER WEIGHTS)
 # =============================================================================
 
-calculate_weighted_average <- function(data, eval_date, half_life_days) {
+calculate_weighted_average <- function(data, eval_date, half_life_days, use_weights = TRUE, se_window_days = 45) {
   # Calculate decay constant from half-life
   lambda <- log(2) / half_life_days
   
@@ -172,40 +216,38 @@ calculate_weighted_average <- function(data, eval_date, half_life_days) {
     mutate(
       days_ago = as.numeric(eval_date - date),
       # Only use polls from before or on the evaluation date
-      # Combine time decay with pollster quality weight
       time_weight = ifelse(days_ago >= 0, exp(-lambda * days_ago), 0),
-      total_weight = time_weight * pollster_weight
+      # Combine time decay with pollster quality weight if enabled
+      total_weight = if (use_weights) time_weight * pollster_weight else time_weight,
+      # Flag for SE calculation (only recent polls)
+      in_se_window = days_ago >= 0 & days_ago <= se_window_days
     ) %>%
     filter(time_weight > 0) %>%
     group_by(party) %>%
     summarise(
       weighted_avg = sum(pct * total_weight) / sum(total_weight),
+      # Weighted standard deviation (using all polls)
+      weighted_var = sum(total_weight * (pct - sum(pct * total_weight) / sum(total_weight))^2) / sum(total_weight),
+      weighted_sd = sqrt(weighted_var),
+      # Effective sample size (only polls within SE window)
+      sum_weights_se = sum(total_weight[in_se_window]),
+      sum_weights_sq_se = sum(total_weight[in_se_window]^2),
+      n_effective = ifelse(sum_weights_sq_se > 0, sum_weights_se^2 / sum_weights_sq_se, 1),
+      # Cap n_effective to prevent overconfidence
+      n_effective = pmin(n_effective, 1000),
+      # Standard error
+      weighted_se = weighted_sd / sqrt(n_effective),
       n_polls = n(),
+      n_polls_se_window = sum(in_se_window),
       .groups = "drop"
     ) %>%
-    mutate(date = eval_date)
-}
-
-# Unadjusted version: time decay only, no pollster weights
-calculate_weighted_average_unadj <- function(data, eval_date, half_life_days) {
-  # Calculate decay constant from half-life
-  lambda <- log(2) / half_life_days
-  
-  data %>%
     mutate(
-      days_ago = as.numeric(eval_date - date),
-      # Only use polls from before or on the evaluation date
-      # Time decay only - equal weight to all pollsters
-      weight = ifelse(days_ago >= 0, exp(-lambda * days_ago), 0)
+      date = eval_date,
+      # Calculate confidence band (using 1.96 for ~95% CI)
+      ci_lower = weighted_avg - 1.96 * weighted_se,
+      ci_upper = weighted_avg + 1.96 * weighted_se
     ) %>%
-    filter(weight > 0) %>%
-    group_by(party) %>%
-    summarise(
-      weighted_avg = sum(pct * weight) / sum(weight),
-      n_polls = n(),
-      .groups = "drop"
-    ) %>%
-    mutate(date = eval_date)
+    select(date, party, weighted_avg, weighted_se, ci_lower, ci_upper, n_polls, n_effective)
 }
 
 # Generate sequence of dates for the trendline
@@ -215,15 +257,28 @@ date_range <- seq(
   by = "1 day"
 )
 
-# Calculate weighted averages for each date (adjusted)
+# Calculate weighted averages for each date (with toggles applied)
 trend_data <- map_dfr(date_range, function(d) {
-  calculate_weighted_average(polls_long, d, HALF_LIFE_DAYS)
+  calculate_weighted_average(polls_long, d, HALF_LIFE_DAYS, use_weights = config$use_pollster_weights)
 })
+
+# Parties that are no longer participating - end their trendlines at last poll
+discontinued_parties <- c("Momentum", "LMP", "MSZP", "Jobbik")
+
+for (party_name in discontinued_parties) {
+  last_poll_date <- polls_long %>%
+    filter(party == party_name) %>%
+    pull(date) %>%
+    max(na.rm = TRUE)
+  
+  trend_data <- trend_data %>%
+    filter(!(party == party_name & date > last_poll_date))
+}
 
 # Calculate unadjusted trend data if enabled
 if (SHOW_UNADJUSTED) {
   trend_data_unadj <- map_dfr(date_range, function(d) {
-    calculate_weighted_average_unadj(polls_long_unadj, d, HALF_LIFE_DAYS)
+    calculate_weighted_average(polls_long_unadj, d, HALF_LIFE_DAYS, use_weights = FALSE)
   })
 }
 
@@ -239,7 +294,8 @@ theme_538_polling <- function() {
       panel.background = element_rect(fill = "#F0F0F0", color = NA),
       
       # Grid
-      panel.grid.major = element_line(color = "#DCDCDC", linewidth = 0.5),
+      panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_line(color = "#DCDCDC", linewidth = 0.5),
       panel.grid.minor = element_blank(),
       
       # Title and subtitle
@@ -248,13 +304,15 @@ theme_538_polling <- function() {
         face = "bold",
         size = 18,
         color = "#222222",
-        margin = margin(b = 5)
+        margin = margin(b = 5),
+        hjust = 0.5
       ),
       plot.subtitle = element_text(
         family = "sans",
         size = 12,
         color = "#666666",
-        margin = margin(b = 15)
+        margin = margin(b = 5),
+        hjust = 0.5
       ),
       plot.caption = element_text(
         family = "sans",
@@ -287,7 +345,7 @@ theme_538_polling <- function() {
         size = 10,
         color = "#444444"
       ),
-      legend.position = "top",
+      legend.position = "bottom",
       legend.direction = "horizontal",
       
       # Margins
@@ -309,13 +367,27 @@ party_colors <- party_colors[names(party_colors) %in% parties_in_data]
 party_labels <- party_labels[names(party_labels) %in% parties_in_data]
 
 # Get endpoint values for main parties to label
-MAIN_PARTIES <- c("Fidesz", "Tisza", "MKKP", "MH")
+MAIN_PARTIES <- c("Fidesz", "Tisza", "MKKP", "MH", "DK")
 
 endpoint_labels <- trend_data %>%
   filter(date == max(date), party %in% MAIN_PARTIES) %>%
   mutate(
     label = sprintf("%.1f", weighted_avg)
   )
+
+# Build subtitle based on settings
+subtitle_text <- paste0("")
+if (config$use_house_effects & config$use_pollster_weights) {
+  subtitle_text <- paste0(subtitle_text, "Updating average of parliamentary polls weighted by recency and pollster quality and adjusted for pollster house effects. 
+Shaded areas represent 95% confidence intervals.")
+} else if (config$use_house_effects) {
+  subtitle_text <- paste0(subtitle_text, " | Adjusted for house effects")
+} else if (config$use_pollster_weights) {
+  subtitle_text <- paste0(subtitle_text, " | Pollster weighted")
+}
+if (SHOW_UNADJUSTED) {
+  subtitle_text <- paste0(subtitle_text, " | Dotted: unadjusted")
+}
 
 # Main plot
 p <- ggplot() +
@@ -335,27 +407,37 @@ p <- ggplot() +
     geom_point(
       data = polls_long,
       aes(x = date, y = pct, color = party),
-      alpha = 0.25,
+      alpha = 0.3,
       size = 1.4,
       shape = 16
     )
   } +
+  # Error bands (95% CI based on weighted standard error)
+  geom_ribbon(
+    data = trend_data,
+    aes(x = date, ymin = ci_lower, ymax = ci_upper, fill = party),
+    alpha = 0.15,
+    linejoin = "round",
+    show.legend = FALSE
+  ) +
   # Trend lines (adjusted - solid)
   geom_line(
     data = trend_data,
     aes(x = date, y = weighted_avg, color = party),
     linewidth = 1.4,
-    alpha = 0.9
+    alpha = 0.95
   ) +
   # Endpoint labels for main parties
   
-  geom_text(
+  geom_text_repel(
     data = endpoint_labels,
     aes(x = date, y = weighted_avg, label = label, color = party),
     hjust = -0.3,
-    vjust = 0.35,
     fontface = "bold",
-    size = 7,
+    size = 9,
+    direction = "y",
+    nudge_x = 5,
+    segment.color = NA,
     show.legend = FALSE
   ) +
   # Scales
@@ -363,6 +445,9 @@ p <- ggplot() +
     values = party_colors,
     labels = party_labels,
     guide = guide_legend(nrow = 1)
+  ) +
+  scale_fill_manual(
+    values = party_colors
   ) +
   scale_y_continuous(
     limits = c(0, NA),
@@ -378,15 +463,11 @@ p <- ggplot() +
   ) +
   # Labels
   labs(
-    title = "Hungary Parliamentary Election Polling",
-    subtitle = paste0(
-      HALF_LIFE_DAYS, "-day half-life average | ",
-      "Solid: adjusted for house effects & pollster ratings",
-      if(SHOW_UNADJUSTED) " | Dotted: unadjusted" else ""
-    ),
+    title = "2026 Hungary Parliamentary Election Polling",
+    subtitle = subtitle_text,
     caption = paste0(
       "Data through ", format(max(polls_long$date), "%B %d, %Y"), 
-      " | House effects applied to Fidesz & Tisza | Chart styled after FiveThirtyEight"
+      " | Created by @231elections"
     ),
     x = NULL,
     y = NULL
@@ -426,17 +507,446 @@ latest_trends <- trend_data %>%
 
 cat("\n=== Current Polling Averages ===\n")
 cat(paste0("(As of ", format(max(trend_data$date), "%B %d, %Y"), 
-           " with ", HALF_LIFE_DAYS, "-day half-life)\n\n"))
+           " with ", HALF_LIFE_DAYS, "-day half-life)\n"))
+cat(paste0("Pollster weights: ", ifelse(config$use_pollster_weights, "ON", "OFF"), "\n"))
+cat(paste0("House effects: ", ifelse(config$use_house_effects, "ON", "OFF"), "\n\n"))
 print(as.data.frame(latest_trends), row.names = FALSE)
 
+
+
+zoom_start_date <- ymd("2025-01-01")
+
+# Filter trend data for zoom
+trend_data_zoom <- trend_data %>%
+  filter(party %in% c("Fidesz", "Tisza"), date >= zoom_start_date)
+
+# Filter poll points for zoom
+polls_long_zoom <- polls_long %>%
+  filter(party %in% c("Fidesz", "Tisza"), date >= zoom_start_date)
+
+# Endpoint labels for zoom
+endpoint_labels_zoom <- trend_data_zoom %>%
+  filter(date == max(date)) %>%
+  mutate(label = sprintf("%.1f", weighted_avg))
+
+# Zoomed plot
+p_zoom <- ggplot() +
+  # Raw poll points (if enabled)
+  {if(SHOW_RAW_POLLS) 
+    geom_point(
+      data = polls_long_zoom,
+      aes(x = date, y = pct, color = party),
+      alpha = 0.3,
+      size = 2,
+      shape = 16
+    )
+  } +
+  # Error bands
+  geom_ribbon(
+    data = trend_data_zoom,
+    aes(x = date, ymin = ci_lower, ymax = ci_upper, fill = party),
+    alpha = 0.15,
+    show.legend = FALSE
+  ) +
+  # Trend lines
+  geom_line(
+    data = trend_data_zoom,
+    aes(x = date, y = weighted_avg, color = party),
+    linewidth = 1.4,
+    alpha = 0.9
+  ) +
+  # Endpoint labels
+  geom_text_repel(
+    data = endpoint_labels_zoom,
+    aes(x = date, y = weighted_avg, label = label, color = party),
+    hjust = -0.3,
+    fontface = "bold",
+    size = 7,
+    direction = "y",
+    nudge_x = 5,
+    segment.color = NA,
+    show.legend = FALSE
+  ) +
+  # Scales
+  scale_color_manual(
+    values = party_colors[c("Fidesz", "Tisza")],
+    labels = party_labels[c("Fidesz", "Tisza")],
+    guide = guide_legend(nrow = 1)
+  ) +
+  scale_fill_manual(
+    values = party_colors[c("Fidesz", "Tisza")]
+  ) +
+  scale_y_continuous(
+    limits = c(30, 50),
+    labels = function(x) paste0(x, "%"),
+    breaks = seq(30, 50, by = 5),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  scale_x_date(
+    limits = c(zoom_start_date, ymd("2026-04-12")),
+    date_breaks = "1 month",
+    date_labels = "%b '%y",
+    expand = expansion(mult = c(0.02, 0))
+  ) +
+  # Labels
+  labs(
+    title = "Hungary Polling: Fidesz vs TISZA",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_538_polling()
+
+# Display the zoomed plot
+print(p_zoom)
+
+
+
+
+
 # =============================================================================
-# OPTIONAL: INTERACTIVE VERSION WITH PLOTLY
+# SPLIT COMPARISON: ADJUSTED vs RAW (Fidesz & Tisza stacked)
 # =============================================================================
 
-# Uncomment below to create an interactive version
-# library(plotly)
-# ggplotly(p) %>%
-#   layout(
-#     legend = list(orientation = "h", y = 1.1),
-#     hovermode = "x unified"
-#   )
+# Calculate raw trend data (no house effects, no pollster weights)
+polls_raw_for_compare <- polls %>%
+  select(date, pollster, sample_size, Fidesz, Tisza) %>%
+  pivot_longer(
+    cols = c(Fidesz, Tisza),
+    names_to = "party",
+    values_to = "pct"
+  ) %>%
+  filter(!is.na(pct)) %>%
+  mutate(pollster_weight = 1)
+
+trend_data_raw <- map_dfr(date_range, function(d) {
+  calculate_weighted_average(polls_raw_for_compare, d, HALF_LIFE_DAYS, use_weights = FALSE)
+}) %>%
+  filter(party %in% c("Fidesz", "Tisza"))
+
+# Get adjusted trend data
+trend_data_adj <- trend_data %>%
+  filter(party %in% c("Fidesz", "Tisza"))
+
+# Raw poll points
+polls_raw_points <- polls %>%
+  select(date, Fidesz, Tisza) %>%
+  pivot_longer(
+    cols = c(Fidesz, Tisza),
+    names_to = "party",
+    values_to = "pct"
+  ) %>%
+  filter(!is.na(pct))
+
+# Colors
+color_unadjusted <- "#1A476F"   # Dark blue for adjusted
+
+# --- FIDESZ PANEL ---
+p_fidesz_compare <- ggplot() +
+  geom_point(
+    data = polls_raw_points %>% filter(party == "Fidesz"),
+    aes(x = date, y = pct),
+    color = "#FD8D3C",
+    alpha = 0.25,
+    size = 1.4,
+    shape = 16
+  ) +
+  # Raw/unadjusted line
+  geom_line(
+    data = trend_data_raw %>% filter(party == "Fidesz"),
+    aes(x = date, y = weighted_avg),
+    color = color_unadjusted,
+    linewidth = 1.2,
+    linetype = 12
+  ) +
+  # Adjusted line (solid, party color)
+  geom_line(
+    data = trend_data_adj %>% filter(party == "Fidesz"),
+    aes(x = date, y = weighted_avg),
+    color = "#FD8D3C",
+    linewidth = 1.2
+  ) +
+  scale_y_continuous(
+    limits = c(30, 50),
+    labels = function(x) paste0(x, "%"),
+    breaks = seq(30, 50, by = 5)
+  ) +
+  scale_x_date(
+    limits = c(ymd(START_DATE), max(polls_long$date)),
+    date_breaks = "2 months",
+    date_labels = "%b '%y"
+  ) +
+  labs(
+    title = "Fidesz-KDNP Support",
+    subtitle = "Dashed line represents unadjusted average of raw poll values",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_538_polling()
+
+# --- TISZA PANEL ---
+p_tisza_compare <- ggplot() +
+  geom_point(
+    data = polls_raw_points %>% filter(party == "Tisza"),
+    aes(x = date, y = pct),
+    color = "#6BAED6",
+    alpha = 0.3,
+    size = 1.4,
+    shape = 16
+  ) +
+  # Raw/unadjusted line
+  geom_line(
+    data = trend_data_raw %>% filter(party == "Tisza"),
+    aes(x = date, y = weighted_avg),
+    color = color_unadjusted,
+    linewidth = 1.2,
+    linetype = 12
+  ) +
+  # Adjusted line (solid, party color)
+  geom_line(
+    data = trend_data_adj %>% filter(party == "Tisza"),
+    aes(x = date, y = weighted_avg),
+    color = "#6BAED6",
+    linewidth = 1.2
+  ) +
+  scale_y_continuous(
+    limits = c(10, 50),
+    labels = function(x) paste0(x, "%"),
+    breaks = seq(10, 50, by = 10)
+  ) +
+  scale_x_date(
+    limits = c(ymd(START_DATE), max(polls_long$date)),
+    date_breaks = "2 months",
+    date_labels = "%b '%y"
+  ) +
+  labs(
+    title = "TISZA Support",
+    subtitle = "Dashed line represents unadjusted average of raw poll values",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_538_polling()
+
+# Combine into stacked plot
+library(patchwork)
+
+p_stacked <- p_fidesz_compare / p_tisza_compare +
+  plot_annotation(
+    caption = paste0("Data through ", format(max(polls_long$date), "%B %d, %Y"))
+  )
+
+print(p_stacked)
+
+print(p_fidesz_compare)
+print(p_tisza_compare)
+
+
+
+# =============================================================================
+# MARGIN PLOT: Fidesz vs Tisza
+# =============================================================================
+
+# Calculate margin (Tisza - Fidesz)
+margin_data <- trend_data_adj %>%
+  select(date, party, weighted_avg) %>%
+  pivot_wider(names_from = party, values_from = weighted_avg) %>%
+  mutate(margin = Tisza - Fidesz)
+
+# Create margin plot
+p_margin <- ggplot(margin_data, aes(x = date, y = margin)) +
+  # Reference line at 0
+  geom_hline(yintercept = 0, color = "#666666", linewidth = 0.5) +
+  # Ribbon showing positive (Tisza ahead) vs negative (Fidesz ahead)
+  geom_ribbon(
+    aes(ymin = pmin(margin, 0), ymax = 0),
+    fill = "#FD8D3C",
+    alpha = 0.4
+  ) +
+  geom_ribbon(
+    aes(ymin = 0, ymax = pmax(margin, 0)),
+    fill = "#6BAED6",
+    alpha = 0.4
+  ) +
+  # Margin line
+  geom_line(linewidth = 1.2, color = "#2D3A4A") +
+  scale_y_continuous(
+    limits = c(-30, 15),
+    labels = function(x) paste0(ifelse(x > 0, "+", ""), x, "%"),
+    breaks = seq(-25, 10, by = 5)
+  ) +
+  scale_x_date(
+    limits = c(ymd(START_DATE), max(polls_long$date)),
+    date_breaks = "2 months",
+    date_labels = "%b '%y",
+    expand = expansion(mult = c(0, 0))
+  )+
+  labs(
+    title = "Margin: TISZA vs Fidesz",
+    caption = paste0("Data through ", format(max(polls_long$date), "%B %d, %Y")),
+    x = NULL,
+    y = "Margin"
+  ) +
+  theme_538_polling() +
+  theme(plot.subtitle = element_text(margin = margin(b = 0)))
+
+print(p_margin)
+
+
+ggsave(
+  "hungary_polling_margin.png",
+  plot = p_margin,
+  width = 12,
+  height = 6,
+  dpi = 300,
+  bg = "#F0F0F0"
+)
+
+cat("\n✓ Margin chart saved as 'hungary_polling_margin.png'\n")
+
+# =============================================================================
+# BEST/WORST MARGIN DAYS
+# =============================================================================
+
+# Best day for Tisza (highest margin)
+best_tisza <- margin_data %>%
+  filter(margin == max(margin, na.rm = TRUE)) %>%
+  slice(1)
+
+# Best day for Fidesz (lowest margin, i.e., most negative)
+best_fidesz <- margin_data %>%
+  filter(margin == min(margin, na.rm = TRUE)) %>%
+  slice(1)
+
+# Current margin
+current_margin <- margin_data %>%
+  filter(date == max(date))
+
+cat("\n=== Margin Summary ===\n\n")
+cat(paste0("Best day for TISZA: ", format(best_tisza$date, "%B %d, %Y"), 
+           " (TISZA +", round(best_tisza$margin, 1), ")\n"))
+cat(paste0("  TISZA: ", round(best_tisza$Tisza, 1), "% | Fidesz: ", round(best_tisza$Fidesz, 1), "%\n\n"))
+
+cat(paste0("Best day for Fidesz: ", format(best_fidesz$date, "%B %d, %Y"), 
+           " (Fidesz +", round(abs(best_fidesz$margin), 1), ")\n"))
+cat(paste0("  Fidesz: ", round(best_fidesz$Fidesz, 1), "% | TISZA: ", round(best_fidesz$Tisza, 1), "%\n\n"))
+
+cat(paste0("Current margin (", format(current_margin$date, "%B %d, %Y"), "): ",
+           ifelse(current_margin$margin > 0, "TISZA +", "Fidesz +"), 
+           round(abs(current_margin$margin), 1), "\n"))
+cat(paste0("  TISZA: ", round(current_margin$Tisza, 1), "% | Fidesz: ", round(current_margin$Fidesz, 1), "%\n"))
+
+
+
+
+
+
+
+# =============================================================================
+# COMBINED ZOOM + MARGIN PLOT
+# =============================================================================
+
+library(patchwork)
+
+# Top panel: Fidesz vs Tisza trendlines (no x-axis labels, no legend yet)
+p_top <- ggplot() +
+  {if(SHOW_RAW_POLLS) 
+    geom_point(
+      data = polls_long %>% filter(party %in% c("Fidesz", "Tisza")),
+      aes(x = date, y = pct, color = party),
+      alpha = 0.3,
+      size = 1.4,
+      shape = 16
+    )
+  } +
+  geom_ribbon(
+    data = trend_data %>% filter(party %in% c("Fidesz", "Tisza")),
+    aes(x = date, ymin = ci_lower, ymax = ci_upper, fill = party),
+    alpha = 0.15,
+    show.legend = FALSE
+  ) +
+  geom_line(
+    data = trend_data %>% filter(party %in% c("Fidesz", "Tisza")),
+    aes(x = date, y = weighted_avg, color = party),
+    linewidth = 1.4
+  ) +
+  scale_color_manual(
+    values = c("Fidesz" = "#FD8D3C", "Tisza" = "#6BAED6"),
+    labels = c("Fidesz" = "Fidesz-KDNP", "Tisza" = "TISZA")
+  ) +
+  scale_fill_manual(
+    values = c("Fidesz" = "#FD8D3C", "Tisza" = "#6BAED6")
+  ) +
+  scale_y_continuous(
+    limits = c(15, 50),
+    labels = function(x) paste0(x, "%"),
+    breaks = seq(15, 50, by = 5)
+  ) +
+  scale_x_date(
+    limits = c(min(trend_data$date), max(trend_data$date)),
+    date_breaks = "2 months",
+    date_labels = "%b '%y",
+    expand = expansion(mult = c(0, 0))
+  ) +
+  labs(
+    title = "Hungary Polling: Fidesz vs TISZA",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_538_polling() +
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = "top",
+    plot.title = element_text(size = 12),      
+    plot.subtitle = element_text(size = 9)   
+  )
+
+# Bottom panel: Margin (no legend, has x-axis)
+p_bottom <- ggplot(margin_data, aes(x = date, y = margin)) +
+  geom_hline(yintercept = 0, color = "#666666", linewidth = 0.5) +
+  geom_ribbon(
+    aes(ymin = pmin(margin, 0), ymax = 0),
+    fill = "#FD8D3C",
+    alpha = 0.3
+  ) +
+  geom_ribbon(
+    aes(ymin = 0, ymax = pmax(margin, 0)),
+    fill = "#6BAED6",
+    alpha = 0.3
+  ) +
+  geom_line(linewidth = 1.4, color = "#2D3A4A") +
+  scale_y_continuous(
+    limits = c(-25, 10),
+    labels = function(x) paste0(ifelse(x > 0, "+", ""), x, "%"),
+    breaks = seq(-25, 10, by = 5)
+  ) +
+  scale_x_date(
+    limits = c(min(trend_data$date), max(trend_data$date)),
+    date_breaks = "2 months",
+    date_labels = "%b '%y",
+    expand = expansion(mult = c(0, 0))
+  ) +
+  labs(
+    title = "Margin",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_538_polling() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 12)       
+  )
+
+# Combine
+p_combined <- p_top / p_bottom +
+  plot_layout(heights = c(1.5, 1)) +
+  theme(plot.margin = margin(1, 10, 1, 10))
+
+print(p_combined)
+
+ggsave(
+  "hungary_polling_combined.png",
+  plot = p_combined,
+  width = 12,
+  height = 10,
+  dpi = 300,
+  bg = "#F0F0F0"
+)
