@@ -16,7 +16,7 @@ library(zoo)
 # =============================================================================
 
 config <- list(
-  half_life = 21,                    # Days for exponential decay
+  half_life = 30,                    # Days for exponential decay
   
   use_pollster_weights = TRUE,      # Toggle ON/OFF
   use_house_effects = TRUE,         # Toggle ON/OFF
@@ -56,7 +56,7 @@ PARTY_CONFIG <- list(
 # =============================================================================
 
 # Read the polling data
-polls <- read_csv("~/downloads/Hungary Parliamentary Elections - 2026_R (5).csv",
+polls <- read_csv("~/downloads/Hungary Parliamentary Elections - 2026_R (6).csv",
                   locale = locale(encoding = "UTF-8"))
 
 # Read house effects data (contains both 2024 and 2026 cycle effects)
@@ -477,20 +477,6 @@ p <- ggplot() +
 # Display the plot
 print(p)
 
-# =============================================================================
-# SAVE THE PLOT
-# =============================================================================
-
-ggsave(
-  "hungary_polling_chart.png",
-  plot = p,
-  width = 12,
-  height = 7,
-  dpi = 300,
-  bg = "#F0F0F0"
-)
-
-cat("\n✓ Chart saved as 'hungary_polling_chart.png'\n")
 
 # =============================================================================
 # CURRENT STANDINGS TABLE
@@ -513,6 +499,8 @@ cat(paste0("House effects: ", ifelse(config$use_house_effects, "ON", "OFF"), "\n
 print(as.data.frame(latest_trends), row.names = FALSE)
 
 
+
+### TISZA vs Fidesz #### 
 
 zoom_start_date <- ymd("2025-01-01")
 
@@ -622,6 +610,14 @@ trend_data_raw <- map_dfr(date_range, function(d) {
   calculate_weighted_average(polls_raw_for_compare, d, HALF_LIFE_DAYS, use_weights = FALSE)
 }) %>%
   filter(party %in% c("Fidesz", "Tisza"))
+
+trend_data_raw <- trend_data_raw %>%
+  group_by(party) %>%
+  arrange(date) %>%
+  mutate(
+    weighted_avg = accumulate(weighted_avg, ~ EMA_ALPHA * .y + (1 - EMA_ALPHA) * .x)
+  ) %>%
+  ungroup()
 
 # Get adjusted trend data
 trend_data_adj <- trend_data %>%
@@ -791,17 +787,6 @@ p_margin <- ggplot(margin_data, aes(x = date, y = margin)) +
 print(p_margin)
 
 
-ggsave(
-  "hungary_polling_margin.png",
-  plot = p_margin,
-  width = 12,
-  height = 6,
-  dpi = 300,
-  bg = "#F0F0F0"
-)
-
-cat("\n✓ Margin chart saved as 'hungary_polling_margin.png'\n")
-
 # =============================================================================
 # BEST/WORST MARGIN DAYS
 # =============================================================================
@@ -942,11 +927,100 @@ p_combined <- p_top / p_bottom +
 
 print(p_combined)
 
-ggsave(
-  "hungary_polling_combined.png",
-  plot = p_combined,
-  width = 12,
-  height = 10,
-  dpi = 300,
-  bg = "#F0F0F0"
-)
+# =============================================================================
+# MARGIN COMPARISON: ADJUSTED vs UNADJUSTED
+# =============================================================================
+
+# Toggle for showing unadjusted margin
+SHOW_UNADJUSTED_MARGIN <- TRUE
+
+# Set start date for margin chart (NULL for full series)
+MARGIN_START_DATE <- "2025-01-01"
+
+# Adjusted margin
+margin_adj <- trend_data_adj %>%
+  select(date, party, weighted_avg) %>%
+  pivot_wider(names_from = party, values_from = weighted_avg) %>%
+  mutate(margin = Tisza - Fidesz)
+
+# Unadjusted margin
+margin_unadj <- trend_data_raw %>%
+  select(date, party, weighted_avg) %>%
+  pivot_wider(names_from = party, values_from = weighted_avg) %>%
+  mutate(margin = Tisza - Fidesz)
+
+# Margin comparison plot
+p_margin_compare <- ggplot() +
+  # Reference line at 0
+  geom_hline(yintercept = 0, color = "#666666", linewidth = 0.5) +
+  # Unadjusted margin line (togglable)
+  {if(SHOW_UNADJUSTED_MARGIN)
+    geom_line(
+      data = margin_unadj,
+      aes(x = date, y = margin),
+      color = "red",
+      linewidth = 1,
+      linetype = "12"
+    )
+  } +
+  # Adjusted margin line
+  geom_line(
+    data = margin_adj,
+    aes(x = date, y = margin),
+    color = "black",
+    linewidth = 1
+  ) +
+  # Shading between adjusted and unadjusted
+  {if(SHOW_UNADJUSTED_MARGIN)
+    list(
+      # Blue: unadjusted favors Tisza (unadjusted margin > adjusted margin)
+      geom_ribbon(
+        data = margin_adj %>%
+          inner_join(margin_unadj, by = "date", suffix = c("_adj", "_unadj")),
+        aes(x = date,
+            ymin = margin_adj,
+            ymax = pmax(margin_unadj, margin_adj)),
+        fill = "#6BAED6",
+        alpha = 0.3
+      ),
+      # Orange: unadjusted favors Fidesz (unadjusted margin < adjusted margin)
+      geom_ribbon(
+        data = margin_adj %>%
+          inner_join(margin_unadj, by = "date", suffix = c("_adj", "_unadj")),
+        aes(x = date,
+            ymin = pmin(margin_unadj, margin_adj),
+            ymax = margin_adj),
+        fill = "#FD8D3C",
+        alpha = 0.3
+      )
+    )
+  } +
+  scale_y_continuous(
+    limits = c(-5, 10),
+    labels = function(x) paste0(ifelse(x > 0, "+", ""), x, "%"),
+    breaks = seq(-5, 10, by = 5)
+  ) +
+  scale_x_date(
+    limits = c(
+      if(!is.null(MARGIN_START_DATE)) ymd(MARGIN_START_DATE) else min(trend_data$date),
+      max(trend_data$date)
+    ),
+    date_breaks = "2 months",
+    date_labels = "%b '%y",
+    expand = expansion(mult = c(0, 0))
+  ) +
+  labs(
+    title = "TISZA–Fidesz Polling Margin",
+    subtitle = paste0(
+      "Solid: adjusted for house effects & pollster ratings",
+      if(SHOW_UNADJUSTED_MARGIN) " | Dotted: unadjusted" else ""
+    ),
+    caption = paste0("Data through ", format(max(polls_long$date), "%B %d, %Y"),
+                     " | Positive = TISZA leads | Negative = Fidesz leads"),
+    x = NULL,
+    y = "Margin"
+  ) +
+  theme_538_polling()
+
+print(p_margin_compare)
+
