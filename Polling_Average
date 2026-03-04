@@ -56,11 +56,11 @@ PARTY_CONFIG <- list(
 # =============================================================================
 
 # Read the polling data
-polls <- read_csv("~/downloads/Hungary Parliamentary Elections - 2026_R (6).csv",
+polls <- read_csv("~/downloads/Hungary Parliamentary Elections - 2026_R (14).csv",
                   locale = locale(encoding = "UTF-8"))
 
 # Read house effects data (contains both 2024 and 2026 cycle effects)
-house_effects <- read_csv("~/downloads/Hungary Parliamentary Elections - Fidesz_TISZA_HE (1).csv",
+house_effects <- read_csv("~/downloads/Hungary Parliamentary Elections - Fidesz_TISZA_HE (3).csv",
                           locale = locale(encoding = "UTF-8")) %>%
   rename(pollster = Pollster)
 
@@ -1023,4 +1023,3 @@ p_margin_compare <- ggplot() +
   theme_538_polling()
 
 print(p_margin_compare)
-
