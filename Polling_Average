@@ -56,7 +56,7 @@ PARTY_CONFIG <- list(
 # =============================================================================
 
 # Read the polling data
-polls <- read_csv("~/downloads/Hungary Parliamentary Elections - 2026_R (14).csv",
+polls <- read_csv("~/downloads/Hungary Parliamentary Elections - 2026_main (3).csv",
                   locale = locale(encoding = "UTF-8"))
 
 # Read house effects data (contains both 2024 and 2026 cycle effects)
@@ -456,7 +456,7 @@ p <- ggplot() +
     expand = expansion(mult = c(0, 0.05))
   ) +
   scale_x_date(
-    limits = c(ymd(START_DATE), ELECTION_DATE),  # From EP election to election day
+    limits = c(ymd(START_DATE), ELECTION_DATE+20),  # From EP election to election day
     date_breaks = "2 months",
     date_labels = "%b '%y",
     expand = expansion(mult = c(0.02, 0.02))
@@ -549,7 +549,7 @@ p_zoom <- ggplot() +
     aes(x = date, y = weighted_avg, label = label, color = party),
     hjust = -0.3,
     fontface = "bold",
-    size = 7,
+    size = 10,
     direction = "y",
     nudge_x = 5,
     segment.color = NA,
@@ -574,7 +574,7 @@ p_zoom <- ggplot() +
     limits = c(zoom_start_date, ymd("2026-04-12")),
     date_breaks = "1 month",
     date_labels = "%b '%y",
-    expand = expansion(mult = c(0.02, 0))
+    expand = expansion(mult = c(0.02, 0.05))
   ) +
   # Labels
   labs(
@@ -765,12 +765,12 @@ p_margin <- ggplot(margin_data, aes(x = date, y = margin)) +
   # Margin line
   geom_line(linewidth = 1.2, color = "#2D3A4A") +
   scale_y_continuous(
-    limits = c(-30, 15),
+    limits = c(-5, 10),
     labels = function(x) paste0(ifelse(x > 0, "+", ""), x, "%"),
     breaks = seq(-25, 10, by = 5)
   ) +
   scale_x_date(
-    limits = c(ymd(START_DATE), max(polls_long$date)),
+    limits = c(ymd("2025-01-01"), max(polls_long$date)),
     date_breaks = "2 months",
     date_labels = "%b '%y",
     expand = expansion(mult = c(0, 0))
